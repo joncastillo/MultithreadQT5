@@ -1,28 +1,20 @@
 #include <QCoreApplication>
-#include <QImage>
-#include <QStringList>
-#include <QVector>
-#include <QRgb>
-#include <iostream>
-#include <sstream>
-#include <QMap>
-#include <iomanip>
-#include <QMessageLogger>
 #include <QCommandLineParser>
-#include "taskbuilder.h"
-#include "testframework/testcaseextractor.h"
-#include "testframework/testexpectation.h"
+#include <QDebug>
+#include <QImage>
+#include <QFile>
 
-#include "testframework/histogram.h"
-#include <QMutex>
-#include <QWaitCondition>
-#include "testframework/histogramcomparetool.h"
+#include <iostream> // for endl
+
+#include "dispatcher.h"
+
+#define CHUNK_SIZE (5000000)
 
 int main(int argc, char *argv[])
 {
     QCoreApplication app(argc, argv);
     QCoreApplication::setApplicationName("Histogram Tool");
-    QCoreApplication::setApplicationVersion("1.0");
+    QCoreApplication::setApplicationVersion("2.0");
 
     // get the commandline arguments
     const QStringList args = app.arguments();
@@ -51,120 +43,75 @@ int main(int argc, char *argv[])
 
     QStringList optionNames = parser.optionNames();
 
+
+
+    Histogram oHistogram;
+    Dispatcher oDispatcher(&oHistogram, CHUNK_SIZE);
+
     if (parser.isSet(sourceImageFileOption) && parser.isSet(outputFileOption))
     {
         qInfo() << " ********************************************";
         qInfo() << " *****         Processing image         *****";
         qInfo() << " ********************************************";
 
-        TaskBuilder oTaskBuilder;
+        QString sourceImageFilename = parser.value(sourceImageFileOption);
+        QImage img;
+        img.load(sourceImageFilename);
 
-        // create histogram file using module under test:
-        qInfo() << " Reading image...";
-        oTaskBuilder.createHistogram(parser.value(sourceImageFileOption),parser.value(outputFileOption));
+        img = img.convertToFormat(QImage::Format_RGBA8888_Premultiplied);
+        uchar *bits = img.bits();
+        qsizetype size = img.sizeInBytes();
 
-        // prevent test framework from proceeding while previous test is being run.
-        while (oTaskBuilder.is_busy) ;
+        qInfo() << " ********************************************";
+        qInfo() << " ***Use dispatcher for parallel processing***";
+        qInfo() << " ********************************************";
 
-        // create histogram from MUT's output file:
-        Histogram actualHistogram(parser.value(outputFileOption));
+        oDispatcher.processBits(bits, size);
 
-        qDebug() << actualHistogram.to_string();
+        qInfo() << " ********************************************";
+        qInfo() << " *****  Serializing result to file      *****";
+        qInfo() << " ********************************************";
+
+        QString outputFilename = parser.value(outputFileOption);
+        QFile outFile(outputFilename);
+        outFile.open(QIODevice::ReadWrite | QIODevice::Text | QIODevice::Truncate);
+        QTextStream oOutFileStream (&outFile);
+
+        oOutFileStream << oHistogram.m_r[0];
+        for (int i = 1 ; i < 256 ; i++)
+        {
+            oOutFileStream << ", ";
+            oOutFileStream << oHistogram.m_r[i];
+        }
+        oOutFileStream << "\r\n";
+
+        oOutFileStream << oHistogram.m_g[0];
+        for (int i = 1 ; i < 256 ; i++)
+        {
+            oOutFileStream << ", ";
+            oOutFileStream << oHistogram.m_g[i];
+        }
+        oOutFileStream << "\r\n";
+
+        oOutFileStream << oHistogram.m_b[0];
+        for (int i = 1 ; i < 256 ; i++)
+        {
+            oOutFileStream << ", ";
+            oOutFileStream << oHistogram.m_b[i];
+        }
+        oOutFileStream << "\r\n";
+
+        outFile.close();
+
+        qInfo() << " ********************************************";
+        qInfo() << " *****            Completed             *****";
+        qInfo() << " ********************************************";
     }
 
-    else if (parser.isSet(testOption))
-    {
-        int totalpass = 0;
-        int totalfail = 0;
-
-        qInfo() << " ********************************************";
-        qInfo() << " *****     Starting Automated Tests     *****";
-        qInfo() << " ********************************************";
-        qInfo() << "";
-        QVector<TestExpectation> testCaseExpectationIntegratedTestPatternType;
-        QVector<TestExpectation> testCaseExpectationIntegratedTestPrecomputedType;
-
-        // extract precomputed histogram from testcases:
-        TestcaseExtractor::obtainTestCases(testCaseExpectationIntegratedTestPatternType, testCaseExpectationIntegratedTestPrecomputedType);
-
-        for (TestExpectation exp: testCaseExpectationIntegratedTestPrecomputedType)
-        {
-            qDebug().noquote() << "Testing: ";
-            qDebug().noquote() << exp.imageFilePath;
-            qDebug().noquote() << "Expected: ";
-            qDebug().noquote() << exp.precomputedHistogram.to_string();
-            qDebug().noquote() << "Actual: ";
-
-            TaskBuilder oTaskBuilder;
-
-            // create histogram file using module under test:
-            oTaskBuilder.createHistogram(exp.imageFilePath,"testOutput.txt");
-
-            // prevent test framework from proceeding while previous test is being run.
-            while (oTaskBuilder.is_busy) ;
-
-            // create histogram from MUT's output file:
-            Histogram actualHistogram("testOutput.txt");
-
-            qDebug().noquote() << actualHistogram.to_string();
-            bool passed = HistogramCompareTool::compare_histograms(exp.precomputedHistogram, actualHistogram);
-
-            if (passed)
-                totalpass++;
-            else
-                totalfail++;
-
-        }
-
-        for (TestExpectation exp: testCaseExpectationIntegratedTestPatternType)
-        {
-            qDebug().noquote() << "Testing: ";
-            qDebug().noquote() << exp.imageFilePath;
-            qDebug().noquote() << "Expected: ";
-            qDebug().noquote() << exp.precomputedHistogram.to_string();
-
-            // create histogram using module under test:
-            TaskBuilder oTaskBuilder;
-            try
-            {
-                oTaskBuilder.createHistogram(exp.imageFilePath,"testoutput.txt");
-            }
-            catch (...)
-            {
-                totalfail++;
-                continue;
-            }
-
-            // prevent reading output file until current has completed.
-            while (oTaskBuilder.is_busy) ;
-
-            Histogram actualHistogram("testoutput.txt");
-
-            qDebug().noquote() << "Actual: ";
-            qDebug().noquote() << actualHistogram.to_string();
-            bool passed = HistogramCompareTool::compare_histograms(exp.precomputedHistogram, actualHistogram);
-            if (passed)
-                totalpass++;
-            else
-                totalfail++;
-        }
-
-        qInfo() << " ********************************************";
-        qInfo() << " **** Automated Integration Test results ****";
-        qInfo() << " ********************************************";
-        qInfo() << " Total Tests:  " << totalpass+totalfail;
-        qInfo() << " Passed Tests: " << totalpass;
-        qInfo() << " Failed Tests: " << totalfail;
-
-    }
     else
     {
         parser.showHelp();
     }
 
-    //return app.exec();
-return 0;
-
+    return 0;
 }
-
-// uchar must be converted to vector for autoptr

@@ -1,247 +1,123 @@
-#include <QObject>
-
-#include <QMutexLocker>
-#include <QMutex>
 #include <QTextStream>
-#include <QWaitCondition>
-#include <QMap>
-
+#include <QThread>
 #include <QDebug>
+#include <QObject>
+#include <QMutexLocker>
+
 #include "dispatcher.h"
-#include "taskbuilder.h"
 
-#include <iostream>
+Dispatcher::Dispatcher(Histogram* poHistogram, int chunkSize)
+    :m_poHistogram(poHistogram)
+{
+    setChunkSize(chunkSize);
+}
+
 Dispatcher::~Dispatcher()
-{}
-Dispatcher::Dispatcher(int chunkSize)
-    : m_chunkSize(chunkSize)
 {
-    registerWorkers();
-    init();
+;
 }
 
-void Dispatcher::init()
+void Dispatcher::setChunkSize(int chunkSize)
 {
-    consolidatedRedChannel.clear();
-    consolidatedGreenChannel.clear();
-    consolidatedBlueChannel.clear();
-
-    consolidatedRedChannel.resize(256);
-    consolidatedGreenChannel.resize(256);
-    consolidatedBlueChannel.resize(256);
+    m_chunkSize = chunkSize;
 }
-void Dispatcher::registerWorkers()
+
+int Dispatcher::getChunkSize() const
 {
-    // determine optimal worker threads:
+    return m_chunkSize;
+}
+void Dispatcher::processBits(uchar* bits, qsizetype size)
+{
+
+    qInfo() << " ********************************************";
+    qInfo() << " *****         Creating threads         *****";
+    qInfo() << " ********************************************";
+
     int optimalThreadCount = QThread::idealThreadCount();
-    //m_oLogger.write( "Optimal thread count is " + QString::number( optimalThreadCount) + ".\n");
-
     // create and start threads
 
-    for (int i = 0 ; i < optimalThreadCount; i++)
+    for (int worker_id = 0 ; worker_id < optimalThreadCount; worker_id++)
     {
         QThread* poThread = new QThread();
-        Worker* poWorker = new Worker(i, this);
-        int worker_id = i;
+        Worker* poWorker = new Worker(worker_id);
+
+
+        QObject::connect(poThread, SIGNAL(started()), poWorker, SLOT(start()));
+        QObject::connect(poWorker, SIGNAL(destroyed()), poThread, SLOT(quit()));
+        QObject::connect(poWorker, SIGNAL(chunkProcessed(int, Histogram*)),
+                                   this, SLOT(chunkProcessed(int,Histogram*) ),
+                                   Qt::DirectConnection);
 
         poWorker->moveToThread(poThread);
-        QObject::connect(poThread, SIGNAL(started()), poWorker, SLOT(start()));
-        QObject::connect(poThread, SIGNAL(finished()), poThread, SLOT(deleteLater()));
-
-        QObject::connect(poWorker, SIGNAL(finished()), poThread, SLOT(quit()));
-        QObject::connect(poWorker, SIGNAL(finished()), poWorker, SLOT(deleteLater()));
-
-        m_mapWorkers[worker_id] = poWorker;
-
-
         poThread->start();
-        //m_oLogger.write( "Worker id " + QString::number( worker_id) + " Created, registered and started.\n");
 
-        availableWorkerIds.push_back(i);
-        //m_oLogger.write( "Worker id " + QString::number(worker_id) + " Marked as available.\n");
-    }
-}
+        m_allWorkerList.push_back(poWorker);
+        m_availableWorkerList.push_back(worker_id);
+   }
 
-void Dispatcher::unregisterWorkers()
-{
-    for (QMap<int, Worker*>::iterator it = m_mapWorkers.begin();
-         it != m_mapWorkers.end();
-         ++it)
+    qInfo() << " ********************************************";
+    qInfo() << " *****      Dispatching tasks           *****";
+    qInfo() << " ********************************************";
+    qInfo() << "";
+
+    qsizetype i = 0;
+
+    while (i < size)
     {
-
-        if (it.value())
         {
-            CommandMessage oMessage;
-            oMessage.setSubMessageType(SubMessageType_e::DISPATCHER_ORIGINATED__TERMINATE_WORKER);
-            it.value()->postMessage(&oMessage);
-        }
-    }
-}
+            QMutexLocker lock(&m_mutexAvailableWorkerList);
 
-// message entry point for Dispatcher
-void Dispatcher::postMessage(Message* poMessage)
-{
-    //m_oLogger.write("Message received.\n");
-
-    m_messageQueueMutex.lock();
-
-    switch (poMessage->getSubMessageType() )
-    {
-
-        case SubMessageType_e::TASKBUILDER_ORIGINATED__ENQUEUE_DISPATCHERTASK:
-        {
-            //m_oLogger.write("Message subtype: TASKBUILDER_ORIGINATED__ENQUEUE_DISPATCHERTASK\n");
-
-            ByteArrayMessage* poMessageWithData = dynamic_cast<ByteArrayMessage*>(poMessage);
-            unsigned int rawDataSize = poMessageWithData->getData().size();
-
-            unsigned int fourByteChunkSize = m_chunkSize*4;
-            unsigned int i = 0;
-
-            for (; (i+fourByteChunkSize) < rawDataSize;  i += fourByteChunkSize)
+            while (m_availableWorkerList.empty())
             {
-                UIntArrayMessage* task = new UIntArrayMessage;
-                task->setSubMessageType(SubMessageType_e::DISPATCHER_ORIGINATED__WORKERTASK_READY);
-                task->setData(poMessageWithData->getData(), i, fourByteChunkSize);
-                m_tasksForDistribution.push_back(task);
-
+                m_wc.wait(&m_mutexAvailableWorkerList);
             }
 
-            if (i < rawDataSize )
+
+            int workerId = m_availableWorkerList.pop();
+
+            if ((i+m_chunkSize*4) < size)
             {
-                UIntArrayMessage* task = new UIntArrayMessage;
-                task->setSubMessageType(SubMessageType_e::DISPATCHER_ORIGINATED__WORKERTASK_READY);
-                task->setData(poMessageWithData->getData(), i, rawDataSize-i);
-                m_tasksForDistribution.push_back(task);
-            }
-        }
-        break;
-
-        case SubMessageType_e::WORKER_ORIGINATED__TASK_COMPLETED:
-        {
-            //m_oLogger.write("Message subtype: WORKER_ORIGINATED__TASK_COMPLETED\n");
-            UIntArrayMessage* poMessageWithData = dynamic_cast<UIntArrayMessage*>(poMessage);
-            int worker_id = (poMessageWithData->getData())[0];
-            QVector<unsigned int>::iterator itRedChannel = poMessageWithData->getData().begin()+1;
-            QVector<unsigned int>::iterator itGreenChannel = itRedChannel+256;
-            QVector<unsigned int>::iterator itBlueChannel = itGreenChannel+256;
-
-            for (int i = 0; i < 256; i++)
-            {
-                consolidatedRedChannel[i] = consolidatedRedChannel[i]+itRedChannel[i];
-                consolidatedGreenChannel[i] = consolidatedGreenChannel[i]+itGreenChannel[i];
-                consolidatedBlueChannel[i] = consolidatedBlueChannel[i]+itBlueChannel[i];
-            }
-
-            availableWorkerIds.push_back(worker_id);
-
-
-            CommandMessage* poCommandMessage = new CommandMessage();
-            poCommandMessage->setSubMessageType(SubMessageType_e::DISPATCHER_ORIGINATED__WORKER_AVAILABLE);
-            m_tasksForProcessing.push_back(poCommandMessage);
-
-            if (availableWorkerIds.size()>=m_mapWorkers.size() && m_tasksForDistribution.empty())
-            {
-                qInfo()<<"All workers available, no tasks left for processing.";
-
-                //m_oLogger.write("All workers available, no tasks left for processing.\n");
-                UIntArrayMessage oMessage;
-                oMessage.setSubMessageType(SubMessageType_e::DISPATCHER_ORIGINATED__TASK_COMPLETED);
-
-                QVector<unsigned int> consolidatedRGBChannel;
-
-                consolidatedRGBChannel.append(consolidatedRedChannel);
-                consolidatedRGBChannel.append(consolidatedGreenChannel);
-                consolidatedRGBChannel.append(consolidatedBlueChannel);
-
-                oMessage.setData(consolidatedRGBChannel,0,256*3);
-
-                m_poTaskBuilder->postMessage(&oMessage);
-                //m_oLogger.write("Consolidated RGB data posted back to task builder.\n");
+                (m_allWorkerList[workerId])->receiveChunk(&(bits[i]),m_chunkSize*4);
+                i+=m_chunkSize*4;
             }
             else
             {
-                //send worker avail message
+                (m_allWorkerList[workerId])->receiveChunk(&(bits[i]),size-i);
+                i+=size-i;
             }
         }
-        break;
-
-        default:
-            break;
     }
-    m_wc.wakeOne();
-    m_messageQueueMutex.unlock();
+
+    qInfo() << " ********************************************";
+    qInfo() << " *****Awaiting completion of all threads*****";
+    qInfo() << " ********************************************";
+    m_mutexAvailableWorkerList.lock();
+    while (m_availableWorkerList.size() != optimalThreadCount)
+        m_wc.wait(&m_mutexAvailableWorkerList);
+    m_mutexAvailableWorkerList.unlock();
+
 }
 
-void Dispatcher::run()
+// slot
+void Dispatcher::chunkProcessed(int thread_id, Histogram* poHistogram)
 {
-    bool isFinished = false;
-    while (1)
+    qInfo() << "Dispatcher receives results from thread #" << thread_id;
+
     {
-        //QMutexLocker locker(&m_messageQueueMutex);
-        m_messageQueueMutex.lock();
+        QMutexLocker lock(&m_mutexConsolidatedHistogram);
+
+        for (int i=0; i <256; i++)
         {
-            ////m_oLogger.write("Dispatcher consumer sleeps.\n";
-            while (m_tasksForDistribution.empty() && m_tasksForProcessing.empty())
-            {
-                m_wc.wait(&m_messageQueueMutex);
-            }
-            ////m_oLogger.write("Consumer awakens.\n";
-
-            if ( !m_tasksForProcessing.empty() )
-            {
-                Message* poCurrentTask = m_tasksForProcessing.front();
-                SubMessageType_e submessageType = poCurrentTask->getSubMessageType();
-
-                if (submessageType == SubMessageType_e::TASKBUILDER_ORIGINATED__TERMINATE_DISPATCHER)
-                {
-                    //m_oLogger.write("message subtype TASKBUILDER_ORIGINATED__TERMINATE_DISPATCHER.\n");
-                    CommandMessage* poMessageWithData = dynamic_cast<CommandMessage*>(poCurrentTask);
-                    delete poMessageWithData;
-
-                    unregisterWorkers();
-                    isFinished = true;
-                }
-                else if (submessageType == SubMessageType_e::DISPATCHER_ORIGINATED__WORKER_AVAILABLE)
-                {
-                    //m_oLogger.write("message subtype DISPATCHER_ORIGINATED__WORKER_AVAILABLE.\n");
-                    CommandMessage* poMessageWithData = dynamic_cast<CommandMessage*>(poCurrentTask);
-                    delete poMessageWithData;
-                }
-                else
-                {
-                    //m_oLogger.write("Warning! An unhandled message has been discarded!\n");
-                    delete poCurrentTask;
-                }
-
-                m_tasksForProcessing.pop_front();
-            }
-
-
-            if ( !m_tasksForDistribution.empty() )
-            {
-                if ( !availableWorkerIds.empty() )
-                {
-                    //m_oLogger.write("Consumer attempts to process a task for distribution.\n");
-
-                    int currentWorkerId=availableWorkerIds.front();
-                    availableWorkerIds.pop_front();
-                    UIntArrayMessage* poMessageWithData = dynamic_cast<UIntArrayMessage*>(m_tasksForDistribution.front());
-                    UIntArrayMessage oMessageForWorker;
-                    oMessageForWorker.setSubMessageType(SubMessageType_e::DISPATCHER_ORIGINATED__ENQUEUE_WORKERTASK);
-                    oMessageForWorker.setData(poMessageWithData->getData(), 0, poMessageWithData->getData().size());
-
-                    //m_oLogger.write("Forwarding task to Worker ID " + QString::number(currentWorkerId) + ".\n");
-                    m_mapWorkers[currentWorkerId]->postMessage(&oMessageForWorker);
-
-                    delete poMessageWithData;
-                    m_tasksForDistribution.pop_front();
-
-                }
-            }
+            m_poHistogram->m_r[i] += poHistogram->m_r[i];
+            m_poHistogram->m_g[i] += poHistogram->m_g[i];
+            m_poHistogram->m_b[i] += poHistogram->m_b[i];
         }
-        m_messageQueueMutex.unlock();
     }
-    emit finished();
+
+    {
+        QMutexLocker lock(&m_mutexAvailableWorkerList);
+        m_availableWorkerList.push_back(thread_id);
+        m_wc.wakeOne();
+    }
 }
 

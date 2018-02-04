@@ -1,52 +1,33 @@
 #ifndef WORKER_H
 #define WORKER_H
 
+
+#include <QVector>
 #include <QQueue>
-#include <QWaitCondition>
+#include "histogram.h"
+#include "workermessage.h"
 
-#include "dispatcher.h"
-#include "message.h"
-
-enum class WorkerStatus_e
-{
-    IDLE,
-    BUSY
-};
-
-// The Worker is a processing node for calculating the number of pixels for every RGB level.
-// Operates in O(N/4) time.
-// main --> imagePreprocessor --> Dispatcher --> (Worker Threads)
-
-class Dispatcher;
-class Worker : public QObject
-{
+class Worker : public QObject {
     Q_OBJECT
+
 public:
-    Worker(int workerId, Dispatcher* poDispatcher);
-    virtual void postMessage(Message* poMessage);
+
+    Worker(int id);
+    virtual ~Worker();
 
 public slots:
+    void receiveChunk(uchar* poRedByte, qsizetype size);
     void start();
 
 signals:
-    void finished();
+
+    void chunkProcessed(int id, Histogram* oHistogram);
 
 private:
-    virtual void run();
 
-
-    int m_workerId;
-    QQueue<Message*> m_tasks;
-    WorkerStatus_e m_status;
-    QMutex m_messageQueueMutex;
-    QMutex m_messageIncomingMutex;
-    QWaitCondition m_wc;
-
-    Dispatcher* m_poDispatcher;
+    QQueue<WorkerMessage> m_oMessageQueue;
+    int m_id;
+    Histogram m_oHistogram;
 };
-
-
-
-
 
 #endif // WORKER_H
